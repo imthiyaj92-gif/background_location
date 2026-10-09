@@ -78,6 +78,7 @@ class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
         val ACTION_STOP_FOREGROUND_SERVICE = "ACTION_STOP_FOREGROUND_SERVICE"
         val ACTION_UPDATE_NOTIFICATION = "ACTION_UPDATE_NOTIFICATION"
         val ACTION_NOTIFICATION_ACTIONED = "ACTION_NOTIFICATION_ACTIONED"
+        private const val ACTION_EXIT_ALARM = "ACTION_EXIT_ALARM"
         val ACTION_ON_BOOT = "ACTION_ON_BOOT"
 
         private const val PACKAGE_NAME =
@@ -180,7 +181,11 @@ class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
             if (NOTIFICATION_ACTION?.isNotEmpty() == true && NOTIFICATION_ACTION_CALLBACK != null) {
                 val actionIntent = Intent(this, LocationUpdatesService::class.java)
                 actionIntent.putExtra("ARG_CALLBACK", NOTIFICATION_ACTION_CALLBACK ?: 0L)
-                actionIntent.action = ACTION_NOTIFICATION_ACTIONED
+                actionIntent.action = if (NOTIFICATION_ACTION == "EXIT ALARM") {
+    ACTION_EXIT_ALARM
+} else {
+    ACTION_NOTIFICATION_ACTIONED
+}
 
                 val action = NotificationCompat.Action.Builder(
                     0, NOTIFICATION_ACTION!!, PendingIntent.getService(
@@ -222,6 +227,7 @@ class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
         when (action) {
             ACTION_START_FOREGROUND_SERVICE -> triggerForegroundServiceStart(intent)
             ACTION_STOP_FOREGROUND_SERVICE -> triggerForegroundServiceStop()
+            ACTION_EXIT_ALARM -> triggerForegroundServiceStop()
             ACTION_UPDATE_NOTIFICATION -> updateNotification()
             ACTION_NOTIFICATION_ACTIONED -> onNotificationActionClick(intent)
             ACTION_ON_BOOT -> {
@@ -444,6 +450,26 @@ class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
         edit.remove("NOTIFICATION_ACTION")
         edit.remove("NOTIFICATION_ACTION_CALLBACK")
         edit.commit()
+        Utils.setRequestingLocationUpdates(this, false)
+
+try {
+    mFusedLocationCallback?.let { callback ->
+        mFusedLocationClient?.removeLocationUpdates(callback)
+            ?.addOnFailureListener { error ->
+                Log.e("LocationService", "Failed to remove fused location updates", error)
+            }
+    }
+} catch (error: SecurityException) {
+    Log.e("LocationService", "Failed to remove fused location updates", error)
+}
+
+try {
+    mLocationManagerCallback?.let { callback ->
+        mLocationManager?.removeUpdates(callback)
+    }
+} catch (error: SecurityException) {
+    Log.e("LocationService", "Failed to remove GPS updates", error)
+}
         stopForeground(true)
         stopSelf()
     }
@@ -464,6 +490,7 @@ class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
     }
 
     private fun onNewLocation(location: Location, locations: List<Location> = ArrayList()) {
+        if (!Utils.requestingLocationUpdates(this)) return
         mLocation = location
         val intent = Intent(ACTION_BROADCAST)
         intent.putExtra(ACTION_BROADCAST_TYPE, ACTION_BROADCAST_LOCATION)
