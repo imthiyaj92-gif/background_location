@@ -397,6 +397,7 @@ class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
     }
 
     fun requestLocationUpdates() {
+        if (!pref.getBoolean("locationActive", false)) return
         Utils.setRequestingLocationUpdates(this, true)
         try {
             if (isGoogleApiAvailable && !this.forceLocationManager) {
@@ -417,6 +418,7 @@ class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
     }
 
     fun updateNotification() {
+        if (!pref.getBoolean("locationActive", false)) return
         if (!isStarted) {
             isStarted = true
             if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
