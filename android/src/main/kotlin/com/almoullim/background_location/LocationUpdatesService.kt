@@ -597,22 +597,52 @@ try {
 
 
     override fun onDestroy() {
-        super.onDestroy()
-        isStarted = false
-        LocalBroadcastManager.getInstance(applicationContext).unregisterReceiver(actionReceiver)
-        try {
-            if (isGoogleApiAvailable && !this.forceLocationManager) {
-                mFusedLocationClient!!.removeLocationUpdates(mFusedLocationCallback!!)
-            } else {
-                mLocationManager!!.removeUpdates(mLocationManagerCallback!!)
-            }
+    super.onDestroy()
+    isStarted = false
 
-            Utils.setRequestingLocationUpdates(this, false)
-            mNotificationManager!!.cancel(NOTIFICATION_ID)
-        } catch (unlikely: SecurityException) {
-            Utils.setRequestingLocationUpdates(this, true)
+    fun cleanup(label: String, operation: () -> Unit) {
+        try {
+            operation()
+        } catch (error: RuntimeException) {
+            Log.e("LocationService", "Cleanup failed: $label", error)
         }
     }
+
+    cleanup("tracking flag") {
+        Utils.setRequestingLocationUpdates(this, false)
+    }
+
+    cleanup("local receiver") {
+        LocalBroadcastManager.getInstance(applicationContext)
+            .unregisterReceiver(actionReceiver)
+    }
+
+    cleanup("fused location updates") {
+        mFusedLocationCallback?.let { callback ->
+            mFusedLocationClient?.removeLocationUpdates(callback)
+                ?.addOnFailureListener { error ->
+                    Log.e(
+                        "LocationService",
+                        "Failed to remove fused location updates",
+                        error
+                    )
+                }
+        }
+    }
+
+    cleanup("GPS updates") {
+        mLocationManagerCallback?.let { callback ->
+            mLocationManager?.removeUpdates(callback)
+        }
+    }
+
+    cleanup("notification") {
+        val manager = mNotificationManager
+            ?: (getSystemService(Context.NOTIFICATION_SERVICE)
+                as? NotificationManager)
+        manager?.cancel(NOTIFICATION_ID)
+    }
+}
 
     private fun getMainActivityClass(context: Context): Class<*>? {
         val packageName = context.packageName
