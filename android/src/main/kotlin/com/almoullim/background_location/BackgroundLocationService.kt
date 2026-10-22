@@ -59,6 +59,8 @@ class BackgroundLocationService : MethodChannel.MethodCallHandler,
      * Signals whether the LocationUpdatesService is bound
      */
     private var bound: Boolean = false
+    private var pendingNativeTrip: String? = null
+    private var pendingNativeAt: Long = 0
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, service: IBinder) {
@@ -113,6 +115,7 @@ class BackgroundLocationService : MethodChannel.MethodCallHandler,
         forceLocationManager: Boolean?,
         callbackHandle: Long?,
         locationCallback: Long?,
+        nativeTripId: String? = null,
     ): Int {
         LocalBroadcastManager.getInstance(context!!).registerReceiver(
             receiver!!, IntentFilter(LocationUpdatesService.ACTION_BROADCAST)
@@ -127,9 +130,10 @@ class BackgroundLocationService : MethodChannel.MethodCallHandler,
             intent.putExtra("force_location_manager", forceLocationManager)
             intent.putExtra("callbackHandle", callbackHandle)
             intent.putExtra("locationCallback", locationCallback)
+            if (nativeTripId != null) intent.putExtra("mapAlarmTripId", nativeTripId)
 
             ContextCompat.startForegroundService(context!!, intent)
-            context!!.bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+            if (nativeTripId == null) context!!.bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
 
         return 0
     }
@@ -145,7 +149,7 @@ class BackgroundLocationService : MethodChannel.MethodCallHandler,
         return false
     }
 
-    private fun stopLocationService(): Int {
+    private fun stopLocationService(synchronous: Boolean = false): Int {
         LocalBroadcastManager.getInstance(context!!).unregisterReceiver(receiver!!)
 
         val intent = Intent(context!!, LocationUpdatesService::class.java)
@@ -154,7 +158,11 @@ class BackgroundLocationService : MethodChannel.MethodCallHandler,
             LocationUpdatesService.ACTION_SERVICE_REQUEST,
             LocationUpdatesService.ACTION_STOP_FOREGROUND_SERVICE
         )
-        LocalBroadcastManager.getInstance(context!!).sendBroadcast(intent)
+        if (synchronous) {
+            LocalBroadcastManager.getInstance(context!!).sendBroadcastSync(intent)
+        } else {
+            LocalBroadcastManager.getInstance(context!!).sendBroadcast(intent)
+        }
 
         if (bound) {
             context!!.unbindService(serviceConnection)
@@ -197,8 +205,99 @@ class BackgroundLocationService : MethodChannel.MethodCallHandler,
         return 0
     }
 
+    /** Step 1 contract: reuse existing GPS startup; no native proximity/audio yet. */
+    private fun handleTripMethod(call: MethodCall, result: MethodChannel.Result) {
+        val appContext = context ?: run {
+            result.error("NO_CONTEXT", "Plugin is detached from the Flutter engine", null)
+            return
+        }
+        val store = TripStateStore(appContext)
+        fun snapshot(state: Map<String, Any?>?): Map<String, Any?> = mapOf(
+            "trip" to state,
+            // TRACKING is persisted intent, not proof of a live GPS subscription.
+            "serviceRunning" to isLocationServiceRunning(),
+        )
+        try {
+            when (call.method) {
+                "getTripState" -> result.success(snapshot(store.get()))
+                "startTrip" -> {
+                    // Validate before permissions or any service/state mutation.
+                    val config = TripStateStore.configuration(call.arguments)
+                    if (!checkPermissions()) {
+                        throw TripStateException("permissionError", "Location permissions must be granted before startTrip")
+                    }
+                    val state = store.start(config)
+                    // Repeated calls must not queue duplicate service starts.
+                    if (!isLocationServiceRunning() && (pendingNativeTrip != config["tripId"] ||
+                            android.os.SystemClock.elapsedRealtime() - pendingNativeAt > 10_000)) {
+                        pendingNativeTrip = config["tripId"] as String
+                        pendingNativeAt = android.os.SystemClock.elapsedRealtime()
+                        try {
+                            startLocationService(false, 1000, 500, 0, 10.0, false, 0L, 0L, config["tripId"] as String)
+                        } catch (error: RuntimeException) {
+                            store.stop(config["tripId"] as String, "START_FAILED")
+                            throw TripStateException("TRIP_START_FAILED", error.message ?: "Service start failed")
+                        }
+                    }
+                    result.success(snapshot(state))
+                }
+                "stopTrip" -> {
+                    val tripId = (call.arguments as? Map<*, *>)?.get("tripId") as? String
+                    if (tripId.isNullOrBlank()) {
+                        throw TripStateException("INVALID_ARGUMENT", "tripId must be nonblank")
+                    }
+                    // A stale UI must never stop a newer trip.
+                    val state = store.stop(tripId, "APP_STOP")
+                    pendingNativeTrip = null
+                    if (state != null) stopLocationService(synchronous = true)
+                    result.success(snapshot(state))
+                }
+            }
+        } catch (error: TripStateException) {
+            if (call.method == "stopTrip" && error.code == "TRIP_PERSIST_FAILED") {
+                // Still honor STOP if durable storage fails.
+                try { stopLocationService(synchronous = true) } catch (cleanupError: RuntimeException) {
+                    Log.e(TAG, "Trip stop cleanup failed", cleanupError)
+                }
+            }
+            result.error(error.code, error.message, null)
+        } catch (error: RuntimeException) {
+            result.error("TRIP_OPERATION_FAILED", error.message, null)
+        }
+    }
+
     override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: MethodChannel.Result) {
         when (call.method) {
+            "getAlarmPresentationStatus" -> {
+                val appContext = context
+                if (appContext == null) result.error("NO_CONTEXT", "Plugin detached", null)
+                else result.success(AlarmPresentationAccess.status(appContext))
+            }
+            "openAlarmPresentationSettings" -> {
+                val currentActivity = activity
+                if (currentActivity == null || currentActivity.isFinishing) {
+                    result.error("NO_ACTIVITY", "Open settings from the visible app", null)
+                } else {
+                    val status = AlarmPresentationAccess.status(currentActivity)
+                    val settings = when {
+                        status["notificationsAllowed"] != true && Build.VERSION.SDK_INT >= 26 ->
+                            Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                                .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, currentActivity.packageName)
+                        status["channelHighImportance"] != true && Build.VERSION.SDK_INT >= 26 ->
+                            Intent(android.provider.Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+                                .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, currentActivity.packageName)
+                                .putExtra(android.provider.Settings.EXTRA_CHANNEL_ID, "map_alarm_native_ringing")
+                        status["fullScreenAllowed"] != true && Build.VERSION.SDK_INT >= 34 ->
+                            Intent(android.provider.Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT,
+                                android.net.Uri.parse("package:${currentActivity.packageName}"))
+                        else -> Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            android.net.Uri.parse("package:${currentActivity.packageName}"))
+                    }
+                    try { currentActivity.startActivity(settings); result.success(true) }
+                    catch (error: RuntimeException) { result.error("SETTINGS_UNAVAILABLE", error.message, null) }
+                }
+            }
+            "startTrip", "getTripState", "stopTrip" -> handleTripMethod(call, result)
             "stop_location_service" -> result.success(stopLocationService())
             "start_location_service" -> {
                 if (!checkPermissions()) {

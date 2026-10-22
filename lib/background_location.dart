@@ -17,7 +17,7 @@ enum LocationPriority {
   priorityBalancedPowerAccuracy,
   // Accurate to within ten meters of the desired target.
   priorityLowPower,
-  // The level of accuracy used when an app isn’t authorized for full accuracy location data.
+  // The level of accuracy used when an app isnâ€™t authorized for full accuracy location data.
   priorityNoPower,
 }
 
@@ -45,6 +45,43 @@ class BackgroundLocation {
 
   static StreamController<Location>? locationCallbackStream;
   static OptLocationCallback? notificationActionCallback;
+
+  /// Android-only trip contract. Persists the trip and requests the existing
+  /// location service. Radius detection and looping alarm playback are native.
+  /// TRACKING is intent; serviceRunning reports foreground liveness.
+  static Future<Map<String, dynamic>> startTrip({
+    required String tripId,
+    required String destinationName,
+    required double destinationLatitude,
+    required double destinationLongitude,
+    required double radiusMeters,
+  }) => _tripMethod('startTrip', {
+    'tripId': tripId,
+    'destinationName': destinationName,
+    'destinationLatitude': destinationLatitude,
+    'destinationLongitude': destinationLongitude,
+    'radiusMeters': radiusMeters,
+  });
+
+  /// Reads durable trip state without starting a service. The trip is null
+  /// before the first start; STOPPED trips remain available for UI recovery.
+  static Future<Map<String, dynamic>> getTripState() =>
+      _tripMethod('getTripState');
+
+  /// Stops only the matching trip. A stale tripId cannot stop a newer trip.
+  static Future<Map<String, dynamic>> stopTrip({required String tripId}) =>
+      _tripMethod('stopTrip', {'tripId': tripId});
+
+  static Future<Map<String, dynamic>> _tripMethod(
+    String method, [Map<String, dynamic>? arguments]
+  ) async {
+    if (!Platform.isAndroid) {
+      throw UnsupportedError('The native trip contract is Android-only');
+    }
+    final state = await _channel.invokeMapMethod<String, dynamic>(method, arguments);
+    if (state == null) throw StateError('$method returned no trip snapshot');
+    return state;
+  }
 
   /// Stop receiving location updates
   static Future<dynamic> stopLocationService() async {

@@ -7,12 +7,16 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
 
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <application>
         <service
             android:name=".LocationUpdatesService"
-            android:foregroundServiceType="location"
+            android:foregroundServiceType="location|mediaPlayback"
             android:enabled="true"
-            android:exported="true"
+            android:exported="false"
+            android:stopWithTask="false"
             android:permission="android.permission.FOREGROUND_SERVICE_LOCATION" />
     </application>
 </manifest>

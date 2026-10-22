@@ -8,6 +8,7 @@ import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.location.*
 import android.location.LocationListener
+import android.net.Uri
 import android.os.*
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -27,6 +28,11 @@ import io.flutter.view.FlutterCallbackInformation
 class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
 
     private var forceLocationManager: Boolean = false
+    private var nativeTripId: String? = null
+    private var ringingTapTripId: String? = null
+    private var ringingTapUri: Uri? = null
+    internal var alarmAudio: AlarmAudio? = null
+    private val tripStore by lazy { TripStateStore(this) }
 
     override fun onBind(intent: Intent?): IBinder {
         UPDATE_INTERVAL_IN_MILLISECONDS =
@@ -95,7 +101,8 @@ class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
 
         var UPDATE_INTERVAL_IN_MILLISECONDS: Long = 1000
         var FASTEST_UPDATE_INTERVAL_IN_MILLISECONDS = UPDATE_INTERVAL_IN_MILLISECONDS / 2
-        private const val NOTIFICATION_ID = 12345678
+        private const val TRACKING_NOTIFICATION_ID = 12345677
+        private const val ALARM_NOTIFICATION_ID = 12345678
 
         private const val STOP_SERVICE = "stop_service"
     }
@@ -126,15 +133,44 @@ class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
     private val notification: NotificationCompat.Builder
         get() {
 
-            val intent = Intent(this, getMainActivityClass(this))
+            val intent = packageManager.getLaunchIntentForPackage(packageName)
+                ?: Intent(this, getMainActivityClass(this) ?: Activity::class.java)
             intent.putExtra(EXTRA_STARTED_FROM_NOTIFICATION, true)
             intent.action = "Localisation"
-            //intent.setClass(this, getMainActivityClass(this))
+            nativeTripId?.let { intent.putExtra("mapAlarmTripId", it) }
+            val ringingTrip = nativeTripId?.let { id ->
+                tripStore.get()?.takeIf { it["tripId"] == id && it["phase"] == "RINGING" }
+            }
+            if (ringingTrip != null) {
+                // Keep one stable tap target for this ringing trip, even as GPS updates.
+                if (ringingTapTripId != nativeTripId || ringingTapUri == null) {
+                    ringingTapTripId = nativeTripId
+                    ringingTapUri = Uri.Builder()
+                        .scheme("mapalarmv3").authority("mapalarmv3.com").path("/hWakeUpAlert")
+                        .appendQueryParameter("destinationName", ringingTrip["destinationName"] as String)
+                        .appendQueryParameter("distanceText", String.format(java.util.Locale.US, "%.2f km",
+                            ((ringingTrip["lastDistanceMeters"] as? Number)?.toDouble() ?: 0.0) / 1000.0))
+                        .appendQueryParameter("tripId", nativeTripId)
+                        .build()
+                }
+                intent.action = Intent.ACTION_VIEW
+                intent.data = ringingTapUri
+                intent.removeCategory(Intent.CATEGORY_LAUNCHER)
+                intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP
+            } else {
+                ringingTapTripId = null
+                ringingTapUri = null
+            }
             val pendingIntent = PendingIntent.getActivity(
                 this,
                 1,
                 intent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+                PendingIntent.FLAG_UPDATE_CURRENT or
+                    (if (ringingTrip != null) PendingIntent.FLAG_IMMUTABLE else PendingIntent.FLAG_MUTABLE),
+                if (ringingTrip != null && Build.VERSION.SDK_INT >= 34) ActivityOptions.makeBasic()
+                    .setPendingIntentCreatorBackgroundActivityStartMode(ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOWED)
+                    .toBundle() else null
             )
 
             val builder = NotificationCompat.Builder(this, "BackgroundLocation")
@@ -142,6 +178,7 @@ class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
                 .setPriority(NotificationCompat.PRIORITY_HIGH).setWhen(System.currentTimeMillis())
                 .setStyle(NotificationCompat.BigTextStyle().bigText(NOTIFICATION_MESSAGE))
                 .setContentIntent(pendingIntent)
+                .setOnlyAlertOnce(true)
 
             try {
                 var resourceId: Int = 0
@@ -227,9 +264,20 @@ class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
         when (action) {
             ACTION_START_FOREGROUND_SERVICE -> triggerForegroundServiceStart(intent)
             ACTION_STOP_FOREGROUND_SERVICE -> triggerForegroundServiceStop()
-            ACTION_EXIT_ALARM -> triggerForegroundServiceStop()
+            ACTION_EXIT_ALARM -> triggerForegroundServiceStop("EXIT_ALARM")
             ACTION_UPDATE_NOTIFICATION -> updateNotification()
             ACTION_NOTIFICATION_ACTIONED -> onNotificationActionClick(intent)
+            null -> {
+                val saved = try { tripStore.get() } catch (error: RuntimeException) { null }
+                if (saved != null && saved["phase"] != "STOPPED") {
+                    triggerForegroundServiceStart(Intent(this, LocationUpdatesService::class.java)
+                        .putExtra("mapAlarmTripId", saved["tripId"] as String)
+                        .putExtra("distance_filter", 10.0))
+                } else {
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+            }
             ACTION_ON_BOOT -> {
                 Log.i("LocationService", "Starting from boot: ${pref.getLong("callbackHandle", 0L)}")
                 intent.putExtra(
@@ -267,11 +315,38 @@ class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
             else -> {
             }
         }
-        return START_STICKY
+        return if (pref.getBoolean("locationActive", false)) START_STICKY else START_NOT_STICKY
     }
 
     fun triggerForegroundServiceStart(intent: Intent) {
+        // A stopTrip can arrive before Android delivers the queued start intent.
+        // Only new trip-contract starts carry this ID; legacy startup is unchanged.
+        val requestedTripId = intent.getStringExtra("mapAlarmTripId")
+        if (requestedTripId != null) {
+            val trip = try {
+                TripStateStore(this).get()
+            } catch (error: RuntimeException) {
+                Log.e(TAG, "Could not validate queued trip start", error)
+                if (!pref.getBoolean("locationActive", false)) stopSelf()
+                return
+            }
+            if (trip?.get("tripId") != requestedTripId || trip["phase"] == "STOPPED") {
+                if (!pref.getBoolean("locationActive", false)) stopSelf()
+                return
+            }
+            if (nativeTripId == requestedTripId && isStarted) {
+                restoreNativeAlarm(trip)
+                return
+            }
+            nativeTripId = requestedTripId
+            NOTIFICATION_CHANNEL_ID = "map_alarm_native_tracking"
+            NOTIFICATION_TITLE = "Map Alarm is active"
+            NOTIFICATION_MESSAGE = "Background location tracking is running"
+            NOTIFICATION_ACTION = "EXIT ALARM"
+            NOTIFICATION_ACTION_CALLBACK = 0L
+        }
         val flutterLoader = FlutterLoader()
+        if (requestedTripId == null) {
         try {
             if(!flutterLoader.initialized()) {
                 flutterLoader.let {
@@ -282,6 +357,7 @@ class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
         } catch (tr: Throwable) {
             Log.w(TAG, "Error starting service on boot", tr)
             return
+        }
         }
         UPDATE_INTERVAL_IN_MILLISECONDS =
             intent?.getLongExtra("interval", UPDATE_INTERVAL_IN_MILLISECONDS)
@@ -386,7 +462,7 @@ class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
             mNotificationManager!!.createNotificationChannel(mChannel)
         }
 
-        ServiceCompat.startForeground(this, NOTIFICATION_ID, notification.build(),
+        postForegroundNotification(currentNotificationId(), notification.build(),
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
             } else {
@@ -394,6 +470,11 @@ class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
             })
 
         updateNotification() // to start the foreground service
+        if (nativeTripId != null) {
+            // Native trips never rely on a Flutter binding to subscribe to GPS.
+            requestLocationUpdates()
+            tripStore.get()?.let { restoreNativeAlarm(it) }
+        }
     }
 
     fun requestLocationUpdates() {
@@ -417,25 +498,136 @@ class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
         }
     }
 
+    private fun currentNotificationId(): Int =
+        if (nativeTripId != null && tripStore.get()?.get("phase") == "RINGING")
+            ALARM_NOTIFICATION_ID else TRACKING_NOTIFICATION_ID
+
+    private fun postForegroundNotification(id: Int, value: Notification, types: Int) {
+        // Android switches the foreground ID and removes its previous notification.
+        // Keep an explicit cleanup for stale entries from earlier service instances/builds.
+        ServiceCompat.startForeground(this, id, value, types)
+        mNotificationManager?.cancel(if (id == ALARM_NOTIFICATION_ID)
+            TRACKING_NOTIFICATION_ID else ALARM_NOTIFICATION_ID)
+    }
+
+    private fun cancelTripNotifications() {
+        val manager = mNotificationManager
+            ?: (getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager)
+        manager?.cancel(TRACKING_NOTIFICATION_ID)
+        manager?.cancel(ALARM_NOTIFICATION_ID)
+        manager?.cancel(1001) // legacy duplicate alarm notification
+    }
+
+    private fun nativeForegroundTypes(): Int {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return 0
+        var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+        if (nativeTripId != null && tripStore.get()?.get("phase") == "RINGING") {
+            types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+        }
+        return types
+    }
+
+    private fun restoreNativeAlarm(state: Map<String, Any?>, alert: Boolean = false) {
+        if (state["tripId"] != nativeTripId || state["phase"] != "RINGING") return
+        NOTIFICATION_CHANNEL_ID = "map_alarm_native_ringing"
+        NOTIFICATION_TITLE = "MAP ALARM"
+        NOTIFICATION_MESSAGE = "You are approaching ${state["destinationName"]}"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(NOTIFICATION_CHANNEL_ID, "Destination alarm", NotificationManager.IMPORTANCE_HIGH)
+            channel.setSound(null, null) // the native player is the sole sound owner
+            mNotificationManager?.createNotificationChannel(channel)
+        }
+        // A distinct ringing ID creates a NEW SystemUI entry, which Android 13 needs for full-screen launch.
+        mNotificationManager?.cancel(1001) // remove a leftover from the previous build
+        val alarmBuilder = notification.setCategory(NotificationCompat.CATEGORY_ALARM)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+            .setOnlyAlertOnce(!alert)
+        // Only the initial radius transition may request automatic presentation.
+        // Subsequent GPS updates and service restorations remain tap-to-open.
+        val canPresent = alert && try { AlarmPresentationAccess.status(this)["canPresent"] == true }
+            catch (error: RuntimeException) {
+                Log.w("MapAlarmNative", "Presentation check failed; keeping audio/notification", error)
+                false
+            }
+        if (canPresent) {
+            alarmBuilder.setFullScreenIntent(alarmBuilder.build().contentIntent, true)
+            Log.i("MapAlarmNative", "Requesting full-screen alarm presentation")
+        } else if (alert) {
+            Log.i("MapAlarmNative", "Full-screen access unavailable; notification/audio fallback")
+        }
+        try {
+            postForegroundNotification(ALARM_NOTIFICATION_ID, alarmBuilder.build(), nativeForegroundTypes())
+        } catch (error: SecurityException) {
+            if (!canPresent) throw error
+            // Permission may change between checking and posting. Preserve the alarm.
+            alarmBuilder.setFullScreenIntent(null, false)
+            postForegroundNotification(ALARM_NOTIFICATION_ID, alarmBuilder.build(), nativeForegroundTypes())
+            Log.w("MapAlarmNative", "Full-screen request rejected; posted fallback", error)
+        }
+        if (alarmAudio == null) alarmAudio = NativeAlarmPlayer(this, { id, status, error ->
+            try { tripStore.audio(id, status, error) } catch (failure: RuntimeException) {
+                Log.e("MapAlarmNative", "Could not record audio status", failure)
+            }
+        })
+        alarmAudio?.start(state["tripId"] as String)
+    }
+
+    internal fun processNativeLocation(location: Location) {
+        val id = nativeTripId ?: return
+        try {
+            val before = tripStore.get()?.get("phase")
+            val state = tripStore.location(id, location) ?: return
+            Log.i("MapAlarmNative", "$id distanceMeters=${state["lastDistanceMeters"]} phase=${state["phase"]}")
+            if (state["phase"] == "RINGING") {
+                if (before != "RINGING") Log.i("MapAlarmNative", "$id MAP ALARM TRIGGERED")
+                restoreNativeAlarm(state, before != "RINGING")
+            } else {
+                NOTIFICATION_MESSAGE = String.format(java.util.Locale.US, "%.2f km remaining",
+                    (state["lastDistanceMeters"] as Number).toDouble() / 1000.0)
+                updateNotification()
+            }
+        } catch (error: RuntimeException) { Log.e("MapAlarmNative", "Location processing failed", error) }
+    }
+
     fun updateNotification() {
         if (!pref.getBoolean("locationActive", false)) return
+        if (nativeTripId != null) {
+            postForegroundNotification(currentNotificationId(), notification.build(), nativeForegroundTypes())
+            isStarted = true
+            return
+        }
         if (!isStarted) {
             isStarted = true
             if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                startForeground(NOTIFICATION_ID, notification.build(), ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+                startForeground(TRACKING_NOTIFICATION_ID, notification.build(), ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
             } else {
-                startForeground(NOTIFICATION_ID, notification.build())
+                startForeground(TRACKING_NOTIFICATION_ID, notification.build())
             }
 
         } else {
             val notificationManager =
                 getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            notificationManager.notify(NOTIFICATION_ID, notification.build())
+            notificationManager.notify(TRACKING_NOTIFICATION_ID, notification.build())
         }
     }
 
-    fun triggerForegroundServiceStop() {
+    fun triggerForegroundServiceStop(reason: String = "SERVICE_STOP") {
         Log.i("LocationService", "triggerForegroundServiceStop")
+        try {
+            TripStateStore(this).stop(reason = reason)
+        } catch (error: RuntimeException) {
+            // Storage failure must never break the existing native EXIT cleanup.
+            Log.e("LocationService", "Could not persist stopped trip", error)
+        }
+        nativeTripId = null
+        try { alarmAudio?.stop() } catch (error: RuntimeException) {
+            Log.e("MapAlarmNative", "Audio cleanup failed", error)
+        }
+        alarmAudio = null
+        mNotificationManager?.cancel(1001)
+        isStarted = false
+        mServiceHandler?.looper?.quitSafely()
+        mServiceHandler = null
         val edit = pref.edit()
         edit.putBoolean("locationActive", false)
         edit.remove("interval")
@@ -473,6 +665,7 @@ try {
     Log.e("LocationService", "Failed to remove GPS updates", error)
 }
         stopForeground(true)
+        cancelTripNotifications()
         stopSelf()
     }
 
@@ -493,6 +686,7 @@ try {
 
     private fun onNewLocation(location: Location, locations: List<Location> = ArrayList()) {
         if (!Utils.requestingLocationUpdates(this)) return
+        if (nativeTripId != null) processNativeLocation(location)
         mLocation = location
         val intent = Intent(ACTION_BROADCAST)
         intent.putExtra(ACTION_BROADCAST_TYPE, ACTION_BROADCAST_LOCATION)
@@ -599,6 +793,12 @@ try {
     override fun onDestroy() {
     super.onDestroy()
     isStarted = false
+    nativeTripId = null
+    try { alarmAudio?.stop() } catch (error: RuntimeException) {
+        Log.e(TAG, "Alarm destroy cleanup failed", error)
+    }
+    alarmAudio = null
+    mServiceHandler?.looper?.quitSafely()
 
     fun cleanup(label: String, operation: () -> Unit) {
         try {
@@ -637,10 +837,7 @@ try {
     }
 
     cleanup("notification") {
-        val manager = mNotificationManager
-            ?: (getSystemService(Context.NOTIFICATION_SERVICE)
-                as? NotificationManager)
-        manager?.cancel(NOTIFICATION_ID)
+        cancelTripNotifications()
     }
 }
 
