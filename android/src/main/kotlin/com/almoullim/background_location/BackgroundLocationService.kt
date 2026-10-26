@@ -216,6 +216,7 @@ class BackgroundLocationService : MethodChannel.MethodCallHandler,
             "trip" to state,
             // TRACKING is persisted intent, not proof of a live GPS subscription.
             "serviceRunning" to isLocationServiceRunning(),
+            "locationHealth" to LocationUpdatesService.locationHealthSnapshot(state?.get("tripId") as? String),
         )
         try {
             when (call.method) {

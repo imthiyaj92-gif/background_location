@@ -18,6 +18,7 @@ import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.google.android.gms.common.*
 import com.google.android.gms.location.*
 import com.google.android.gms.location.LocationRequest
+import com.google.android.gms.tasks.CancellationTokenSource
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.embedding.engine.dart.DartExecutor
 import io.flutter.embedding.engine.loader.FlutterLoader
@@ -33,6 +34,30 @@ class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
     private var ringingTapUri: Uri? = null
     internal var alarmAudio: AlarmAudio? = null
     private val tripStore by lazy { TripStateStore(this) }
+    internal var locationHealth: LocationHealthMonitor? = null
+    private val healthHandler = Handler(Looper.getMainLooper())
+    private var gpsGeneration = 0
+    private var subscriptionChangePending = false
+    private var lastHealthNotice: String? = null
+    private val healthTick = object : Runnable {
+        override fun run() {
+            val monitor = locationHealth ?: return
+            if (!pref.getBoolean("locationActive", false) || nativeTripId == null) return
+            // Health checks never replace ringing presentation or retry its audio.
+            var checkAgain = true
+            try {
+                checkAgain = tripStore.get()?.get("phase") == "TRACKING"
+                if (checkAgain) {
+                    monitor.tick()
+                    refreshTrackingHealthNotice()
+                }
+            } catch (error: RuntimeException) {
+                Log.w("MapAlarmNative", "Location health check unavailable", error)
+            }
+            if (checkAgain && locationHealth === monitor)
+                healthHandler.postDelayed(this, LocationHealthMonitor.CHECK_MS)
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder {
         UPDATE_INTERVAL_IN_MILLISECONDS =
@@ -73,6 +98,12 @@ class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
     private var backgroundChannel: MethodChannel? = null
 
     companion object {
+        private var healthOwner: java.lang.ref.WeakReference<LocationUpdatesService>? = null
+        internal fun locationHealthSnapshot(tripId: String?): Map<String, Any?>? {
+            val owner = healthOwner?.get() ?: return null
+            if (tripId == null || owner.nativeTripId != tripId) return null
+            return owner.locationHealth?.snapshot()
+        }
         var NOTIFICATION_CHANNEL_ID = "channel_01"
         var NOTIFICATION_TITLE = "Background service is running"
         var NOTIFICATION_MESSAGE = "Background service is running"
@@ -339,6 +370,11 @@ class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
                 return
             }
             nativeTripId = requestedTripId
+            stopLocationHealth()
+            locationHealth = LocationHealthMonitor(
+                { SystemClock.elapsedRealtime() }, { locationProblem() },
+                { done -> probeFreshLocation(done) }, { done -> renewLocationSubscription(done) })
+            healthOwner = java.lang.ref.WeakReference(this)
             NOTIFICATION_CHANNEL_ID = "map_alarm_native_tracking"
             NOTIFICATION_TITLE = "Map Alarm is active"
             NOTIFICATION_MESSAGE = "Background location tracking is running"
@@ -426,8 +462,10 @@ class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
         if (isGoogleApiAvailable && !this.forceLocationManager) {
             mFusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
 
+            val generation = gpsGeneration
             mFusedLocationCallback = object : LocationCallback() {
                 override fun onLocationResult(locationResult: LocationResult) {
+                    if (generation != gpsGeneration) return
                     // Smart cast to 'Location' is impossible, because 'locationResult.lastLocation'
                     // is a property that has open or custom getter
                     val newLastLocation = locationResult.lastLocation
@@ -440,7 +478,9 @@ class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
         } else {
             mLocationManager = getSystemService(LOCATION_SERVICE) as LocationManager?
 
+            val generation = gpsGeneration
             mLocationManagerCallback = LocationListener { location ->
+                if (generation != gpsGeneration) return@LocationListener
                 onNewLocation(location)
             }
         }
@@ -474,17 +514,28 @@ class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
             // Native trips never rely on a Flutter binding to subscribe to GPS.
             requestLocationUpdates()
             tripStore.get()?.let { restoreNativeAlarm(it) }
+            refreshTrackingHealthNotice()
+            healthHandler.postDelayed(healthTick, LocationHealthMonitor.CHECK_MS)
         }
     }
 
-    fun requestLocationUpdates() {
+    fun requestLocationUpdates(completed: ((Boolean) -> Unit)? = null) {
         if (!pref.getBoolean("locationActive", false)) return
+        if (nativeTripId != null && subscriptionChangePending) { completed?.invoke(false); return }
+        val generation = gpsGeneration
+        subscriptionChangePending = true
+        fun finish(success: Boolean) {
+            if (generation != gpsGeneration) return
+            subscriptionChangePending = false
+            locationHealth?.subscriptionResult(success)
+            completed?.invoke(success)
+        }
         Utils.setRequestingLocationUpdates(this, true)
         try {
             if (isGoogleApiAvailable && !this.forceLocationManager) {
                 mFusedLocationClient!!.requestLocationUpdates(
                     mLocationRequest!!, mFusedLocationCallback!!, Looper.myLooper()
-                )
+                ).addOnCompleteListener { finish(it.isSuccessful) }
             } else {
                 mLocationManager?.requestLocationUpdates(
                     LocationManager.GPS_PROVIDER,
@@ -492,10 +543,129 @@ class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
                     0f,
                     mLocationManagerCallback!!
                 )
+                finish(mLocationManager != null)
             }
         } catch (unlikely: SecurityException) {
             Utils.setRequestingLocationUpdates(this, false)
+            finish(false)
+        } catch (error: RuntimeException) {
+            Log.w("MapAlarmNative", "Location subscription failed", error)
+            finish(false)
         }
+    }
+
+    private fun locationProblem(): String? {
+        if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.ACCESS_FINE_LOCATION) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED) return "PERMISSION_REQUIRED"
+        val manager = getSystemService(LOCATION_SERVICE) as LocationManager
+        return if (!androidx.core.location.LocationManagerCompat.isLocationEnabled(manager))
+            "LOCATION_DISABLED" else null
+    }
+
+    private fun probeFreshLocation(done: () -> Unit): () -> Unit {
+        val generation = gpsGeneration
+        var cancelled = false
+        val source = CancellationTokenSource()
+        val signal = CancellationSignal()
+        try {
+            if (isGoogleApiAvailable && !forceLocationManager) {
+                val request = CurrentLocationRequest.Builder()
+                    .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
+                    .setMaxUpdateAgeMillis(0).setDurationMillis(30_000).build()
+                mFusedLocationClient!!.getCurrentLocation(request, source.token)
+                    .addOnCompleteListener { task ->
+                        if (!cancelled && generation == gpsGeneration) {
+                            if (task.isSuccessful) task.result?.let { onNewLocation(it) }
+                            done()
+                        }
+                    }
+            } else {
+                // Compat handles pre-Android 11 and supports cancellation of the single fix.
+                androidx.core.location.LocationManagerCompat.getCurrentLocation(
+                    mLocationManager!!, LocationManager.GPS_PROVIDER, signal,
+                    ContextCompat.getMainExecutor(this)) { fix ->
+                    if (!cancelled && generation == gpsGeneration) {
+                        // Compat can return a cached fix. Never use that as recovery evidence.
+                        if (fix != null && SystemClock.elapsedRealtimeNanos() - fix.elapsedRealtimeNanos in 0..1_000_000_000L)
+                            onNewLocation(fix)
+                        done()
+                    }
+                }
+            }
+        } catch (error: RuntimeException) {
+            Log.w("MapAlarmNative", "Fresh location check failed", error)
+            done()
+        }
+        return { cancelled = true; source.cancel(); signal.cancel() }
+    }
+
+    private fun renewLocationSubscription(done: (Boolean) -> Unit): () -> Unit {
+        var cancelled = false
+        val generation = gpsGeneration
+        // Never add another request unless removal of the previous request completed.
+        if (subscriptionChangePending) { done(false); return {} }
+        subscriptionChangePending = true
+        fun removed(success: Boolean) {
+            if (generation != gpsGeneration) return
+            subscriptionChangePending = false
+            if (!pref.getBoolean("locationActive", false)) return
+            // A fresh fix may cancel recovery while removal is in flight. Still restore
+            // the original subscription unless STOP/destroy invalidated this generation.
+            if (success) requestLocationUpdates { if (!cancelled) done(it) }
+            else if (!cancelled) done(false)
+        }
+        try {
+            if (isGoogleApiAvailable && !forceLocationManager) {
+                mFusedLocationClient!!.removeLocationUpdates(mFusedLocationCallback!!)
+                    .addOnCompleteListener { removed(it.isSuccessful) }
+            } else {
+                mLocationManager!!.removeUpdates(mLocationManagerCallback!!)
+                removed(true)
+            }
+        } catch (error: RuntimeException) {
+            Log.w("MapAlarmNative", "Location resubscription failed", error)
+            removed(false)
+        }
+        return { cancelled = true }
+    }
+
+    private fun stopLocationHealth() {
+        gpsGeneration++ // Invalidates old location, probe and subscription completions.
+        healthHandler.removeCallbacksAndMessages(null)
+        locationHealth?.stop()
+        locationHealth = null
+        subscriptionChangePending = false
+        lastHealthNotice = null
+        if (healthOwner?.get() === this) healthOwner = null
+    }
+
+    private fun refreshTrackingHealthNotice() {
+        val state = tripStore.get() ?: return
+        if (state["tripId"] != nativeTripId || state["phase"] != "TRACKING") return
+        val health = locationHealth?.snapshot()
+        val distance = (state["lastDistanceMeters"] as? Number)?.toDouble()?.let {
+            String.format(java.util.Locale.US, "%.2f km", it / 1000.0) }
+        val age = (health?.get("fixAgeMs") as? Number)?.toLong()
+        val ageLabel = when {
+            age == null -> "age unverified"
+            age < 60_000 -> "${age / 1000}s ago"
+            else -> "${age / 60_000} min ago"
+        }
+        val label = when (health?.get("state")) {
+            "FRESH" -> "${distance ?: "Location acquired"} remaining"
+            "LOCATION_DISABLED" -> "Location is switched off"
+            "PERMISSION_REQUIRED" -> "Location permission needed"
+            "CHECKING" -> "Checking GPS"
+            "SUBSCRIPTION_ERROR" -> "Location updates unavailable"
+            "WAITING" -> "Waiting for GPS"
+            else -> "Location not updated"
+        }
+        val message = if (health?.get("state") == "FRESH" || distance == null) label
+            else "$label. Last known: $distance ($ageLabel)"
+        if (message == lastHealthNotice) return
+        lastHealthNotice = message
+        NOTIFICATION_MESSAGE = message
+        updateNotification()
     }
 
     private fun currentNotificationId(): Int =
@@ -574,17 +744,24 @@ class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
 
     internal fun processNativeLocation(location: Location) {
         val id = nativeTripId ?: return
+        locationHealth?.callbackReceived()
         try {
             val before = tripStore.get()?.get("phase")
             val state = tripStore.location(id, location) ?: return
+            locationHealth?.accepted(location.elapsedRealtimeNanos / 1_000_000)
             Log.i("MapAlarmNative", "$id distanceMeters=${state["lastDistanceMeters"]} phase=${state["phase"]}")
             if (state["phase"] == "RINGING") {
+                healthHandler.removeCallbacksAndMessages(null)
+                locationHealth?.disableRecovery() // Keep GPS/audio and fix age; cancel recovery only.
                 if (before != "RINGING") Log.i("MapAlarmNative", "$id MAP ALARM TRIGGERED")
                 restoreNativeAlarm(state, before != "RINGING")
             } else {
-                NOTIFICATION_MESSAGE = String.format(java.util.Locale.US, "%.2f km remaining",
-                    (state["lastDistanceMeters"] as Number).toDouble() / 1000.0)
-                updateNotification()
+                if (locationHealth != null) refreshTrackingHealthNotice()
+                else { // Legacy service/test callers without the native health lifecycle.
+                    NOTIFICATION_MESSAGE = String.format(java.util.Locale.US, "%.2f km remaining",
+                        (state["lastDistanceMeters"] as Number).toDouble() / 1000.0)
+                    updateNotification()
+                }
             }
         } catch (error: RuntimeException) { Log.e("MapAlarmNative", "Location processing failed", error) }
     }
@@ -613,6 +790,7 @@ class LocationUpdatesService : Service(), MethodChannel.MethodCallHandler {
 
     fun triggerForegroundServiceStop(reason: String = "SERVICE_STOP") {
         Log.i("LocationService", "triggerForegroundServiceStop")
+        stopLocationHealth()
         try {
             TripStateStore(this).stop(reason = reason)
         } catch (error: RuntimeException) {
@@ -792,6 +970,7 @@ try {
 
     override fun onDestroy() {
     super.onDestroy()
+    stopLocationHealth()
     isStarted = false
     nativeTripId = null
     try { alarmAudio?.stop() } catch (error: RuntimeException) {
